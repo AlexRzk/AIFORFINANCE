@@ -545,15 +545,19 @@ def generate_price_data(n_samples: int = 100000) -> np.ndarray:
     return prices
 
 
-def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 10000):
+def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 5000):
     """Main training function."""
     
     # Get GPU settings
     settings = gpu_info["settings"]
     
+    # Reduce min_buffer for faster start
+    min_buffer = min(1000, settings["buffer_size"] // 10)
+    
     # Generate data
     logger.info("Generating price data...")
     prices = generate_price_data(200000)
+    logger.info(f"✅ Generated {len(prices):,} price points")
     
     # Create env and agent
     env_config = EnvConfig(context_dim=64, max_steps=1000)
@@ -565,8 +569,10 @@ def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 10000):
         num_quantiles=settings["num_quantiles"],
         batch_size=settings["batch_size"],
         buffer_size=settings["buffer_size"],
+        min_buffer=min_buffer,  # Start training sooner
         device=DEVICE,
     )
+    logger.info(f"✅ Agent created, will start training after {min_buffer:,} samples")
     
     dsr = DifferentialSharpeRatio()
     
@@ -606,8 +612,15 @@ def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 10000):
             dsr.reset()
             episode_reward = 0
         
-        # Logging
+        # Progress bar every 1000 steps
+        if (step + 1) % 1000 == 0:
+            pct = (step + 1) / total_timesteps * 100
+            bar = "█" * int(pct // 5) + "░" * (20 - int(pct // 5))
+            print(f"\r[{bar}] {pct:.1f}% - Step {step+1:,}", end="", flush=True)
+        
+        # Detailed logging
         if (step + 1) % eval_freq == 0:
+            print()  # New line after progress bar
             elapsed = time.time() - start_time
             mean_return = np.mean(episode_returns[-10:]) if episode_returns else 0
             logger.info(
