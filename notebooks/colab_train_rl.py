@@ -545,8 +545,85 @@ def generate_price_data(n_samples: int = 100000) -> np.ndarray:
     return prices
 
 
-def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 5000):
-    """Main training function."""
+def fetch_binance_data(
+    symbol: str = "BTCUSDT",
+    interval: str = "1h",
+    days: int = 365,
+) -> Optional[np.ndarray]:
+    """Fetch real price data from Binance.
+    
+    Args:
+        symbol: Trading pair (e.g., BTCUSDT, ETHUSDT)
+        interval: Candle interval (1m, 5m, 1h, 4h, 1d)
+        days: Number of days of historical data
+        
+    Returns:
+        Array of close prices or None if fetch fails
+    """
+    try:
+        import ccxt
+    except ImportError:
+        logger.warning("ccxt not installed - install with: pip install ccxt")
+        return None
+    
+    try:
+        exchange = ccxt.binance({'enableRateLimit': True})
+        logger.info(f"Fetching {days} days of {symbol} data from Binance...")
+        
+        # Convert interval to milliseconds
+        interval_ms = {
+            '1m': 60000, '5m': 300000, '15m': 900000, '1h': 3600000,
+            '4h': 14400000, '1d': 86400000
+        }.get(interval, 3600000)
+        
+        all_ohlcv = []
+        end_time = int(time.time() * 1000)
+        start_time = end_time - (days * 24 * 3600 * 1000)
+        
+        current_time = start_time
+        batch_count = 0
+        while current_time < end_time:
+            try:
+                ohlcv = exchange.fetch_ohlcv(symbol, interval, current_time, limit=1000)
+                if not ohlcv:
+                    break
+                all_ohlcv.extend(ohlcv)
+                current_time = ohlcv[-1][0] + interval_ms
+                batch_count += 1
+                
+                if batch_count % 10 == 0:
+                    logger.info(f"  Fetched {len(all_ohlcv):,} candles...")
+                    
+            except Exception as e:
+                logger.warning(f"Error fetching batch: {e}")
+                break
+        
+        if not all_ohlcv:
+            logger.warning("No data fetched")
+            return None
+        
+        # Extract close prices and sort by timestamp
+        prices = np.array([candle[4] for candle in sorted(all_ohlcv, key=lambda x: x[0])], dtype=np.float32)
+        logger.info(f"✅ Fetched {len(prices):,} candles for {symbol}")
+        
+        return prices
+        
+    except Exception as e:
+        logger.error(f"Error fetching Binance data: {e}")
+        return None
+
+
+def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 5000, use_real_data: bool = False,
+                   symbol: str = "BTCUSDT", days: int = 365):
+    """Main training function.
+    
+    Args:
+        total_timesteps: Number of training steps
+        eval_freq: Evaluation frequency
+        use_real_data: If True, fetch real data from Binance; if False, use synthetic data
+        symbol: Trading symbol (e.g., BTCUSDT, ETHUSDT)
+        days: Number of days of historical data to fetch
+    """
     
     # Get GPU settings
     settings = gpu_info["settings"]
@@ -554,10 +631,18 @@ def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 5000):
     # Reduce min_buffer for faster start
     min_buffer = min(1000, settings["buffer_size"] // 10)
     
-    # Generate data
-    logger.info("Generating price data...")
-    prices = generate_price_data(200000)
-    logger.info(f"✅ Generated {len(prices):,} price points")
+    # Generate or fetch data
+    if use_real_data:
+        logger.info(f"Fetching real data from Binance ({symbol}, {days} days)...")
+        prices = fetch_binance_data(symbol, interval="1h", days=days)
+        if prices is None:
+            logger.warning("Failed to fetch real data, falling back to synthetic data")
+            prices = generate_price_data(200000)
+    else:
+        logger.info("Generating synthetic price data...")
+        prices = generate_price_data(200000)
+    
+    logger.info(f"✅ Using {len(prices):,} price points for training")
     
     # Create env and agent
     env_config = EnvConfig(context_dim=64, max_steps=1000)
@@ -646,13 +731,37 @@ def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 5000):
 # ============================================================================
 
 if __name__ == "__main__":
-    # Train for 100k steps (about 10-20 min on T4)
-    # Increase to 500k+ for better results
-    agent = train_rl_agent(total_timesteps=100000, eval_freq=10000)
+    import sys
+    
+    # Training options
+    use_real_data = "--real" in sys.argv
+    symbol = "BTCUSDT"  # Change to ETHUSDT, BNBUSDT, etc. for other assets
+    
+    if use_real_data:
+        print("\n" + "="*60)
+        print("TRAINING WITH REAL DATA FROM BINANCE")
+        print("="*60 + "\n")
+        agent = train_rl_agent(
+            total_timesteps=100000,
+            eval_freq=10000,
+            use_real_data=True,
+            symbol=symbol,
+            days=365
+        )
+    else:
+        print("\n" + "="*60)
+        print("TRAINING WITH SYNTHETIC DATA")
+        print("To use real Binance data, run with: python colab_train_rl.py --real")
+        print("="*60 + "\n")
+        agent = train_rl_agent(
+            total_timesteps=100000,
+            eval_freq=10000,
+            use_real_data=False
+        )
     
     print("\n✅ Training complete!")
     print("📁 Model saved to: best_rl_agent.pt")
     print("\nNext steps:")
-    print("  1. Increase timesteps for better performance")
-    print("  2. Load TFT model for context-aware trading")
-    print("  3. Test on real market data")
+    print("  1. Run backtesting: python colab_backtest_rl.py")
+    print("  2. Increase timesteps for better performance")
+    print("  3. Try different symbols: ETHUSDT, BNBUSDT, etc.")
