@@ -531,18 +531,8 @@ class QRDQNAgent:
 # ============================================================================
 
 def generate_price_data(n_samples: int = 100000) -> np.ndarray:
-    """Generate synthetic GARCH-like price data."""
-    np.random.seed(42)
-    
-    volatility = np.zeros(n_samples)
-    volatility[0] = 0.001
-    for i in range(1, n_samples):
-        volatility[i] = 0.00001 + 0.1 * volatility[i-1] + 0.85 * (np.random.randn()**2) * 0.0001
-    
-    returns = np.random.randn(n_samples) * np.sqrt(volatility) + 0.00001
-    prices = np.exp(np.cumsum(returns) + np.log(50000))
-    
-    return prices
+    """Generate synthetic GARCH-like price data. (Deprecated: use generate_realistic_price_data)"""
+    return generate_realistic_price_data(n_samples)
 
 
 def fetch_binance_data(
@@ -613,6 +603,103 @@ def fetch_binance_data(
         return None
 
 
+def fetch_bybit_data(
+    symbol: str = "BTCUSDT",
+    interval: str = "60",
+    days: int = 365,
+) -> Optional[np.ndarray]:
+    """Fetch real price data from Bybit (alternative to Binance).
+    
+    Args:
+        symbol: Trading pair (e.g., BTCUSDT)
+        interval: Candle interval in minutes (1, 5, 15, 60, 240, 1440)
+        days: Number of days of historical data
+        
+    Returns:
+        Array of close prices or None if fetch fails
+    """
+    try:
+        import ccxt
+    except ImportError:
+        logger.warning("ccxt not installed")
+        return None
+    
+    try:
+        exchange = ccxt.bybit({'enableRateLimit': True})
+        logger.info(f"Fetching {days} days of {symbol} data from Bybit...")
+        
+        all_ohlcv = []
+        end_time = int(time.time() * 1000)
+        start_time = end_time - (days * 24 * 3600 * 1000)
+        
+        current_time = start_time
+        batch_count = 0
+        while current_time < end_time:
+            try:
+                ohlcv = exchange.fetch_ohlcv(symbol, interval, current_time, limit=1000)
+                if not ohlcv:
+                    break
+                all_ohlcv.extend(ohlcv)
+                current_time = ohlcv[-1][0] + int(interval) * 60000
+                batch_count += 1
+                
+                if batch_count % 10 == 0:
+                    logger.info(f"  Fetched {len(all_ohlcv):,} candles...")
+                    
+            except Exception as e:
+                logger.warning(f"Error fetching batch: {e}")
+                break
+        
+        if not all_ohlcv:
+            logger.warning("No data fetched from Bybit")
+            return None
+        
+        prices = np.array([candle[4] for candle in sorted(all_ohlcv, key=lambda x: x[0])], dtype=np.float32)
+        logger.info(f"✅ Fetched {len(prices):,} candles for {symbol} from Bybit")
+        
+        return prices
+        
+    except Exception as e:
+        logger.error(f"Error fetching Bybit data: {e}")
+        return None
+
+
+def generate_realistic_price_data(n_samples: int = 100000, trend: float = 0.00001) -> np.ndarray:
+    """Generate realistic price data with trend and mean reversion (alternative when API blocked).
+    
+    Args:
+        n_samples: Number of price points to generate
+        trend: Daily drift (0.00001 = 0.001% per hour)
+        
+    Returns:
+        Array of simulated prices
+    """
+    np.random.seed(42)
+    
+    # GARCH-like volatility
+    volatility = np.zeros(n_samples)
+    volatility[0] = 0.001
+    for i in range(1, n_samples):
+        volatility[i] = 0.00001 + 0.1 * volatility[i-1] + 0.85 * (np.random.randn()**2) * 0.0001
+    
+    # Mean reversion component
+    mean_price = 50000
+    mean_reversion = 0.01
+    price_deviation = 0.0
+    
+    prices = [mean_price]
+    for i in range(1, n_samples):
+        # Mean reversion
+        price_deviation = price_deviation * (1 - mean_reversion) + np.random.randn() * 0.001
+        
+        # Log returns with trend
+        log_return = (trend + price_deviation) + np.random.randn() * np.sqrt(volatility[i])
+        new_price = prices[-1] * np.exp(log_return)
+        prices.append(new_price)
+    
+    return np.array(prices, dtype=np.float32)
+
+
 def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 5000, use_real_data: bool = False,
                    symbol: str = "BTCUSDT", days: int = 365):
     """Main training function.
@@ -620,7 +707,7 @@ def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 5000, use_rea
     Args:
         total_timesteps: Number of training steps
         eval_freq: Evaluation frequency
-        use_real_data: If True, fetch real data from Binance; if False, use synthetic data
+        use_real_data: If True, try to fetch real data; if False, use synthetic data
         symbol: Trading symbol (e.g., BTCUSDT, ETHUSDT)
         days: Number of days of historical data to fetch
     """
@@ -633,14 +720,30 @@ def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 5000, use_rea
     
     # Generate or fetch data
     if use_real_data:
-        logger.info(f"Fetching real data from Binance ({symbol}, {days} days)...")
+        logger.info("Attempting to fetch real data...")
+        
+        # Try Binance first
         prices = fetch_binance_data(symbol, interval="1h", days=days)
+        
+        # If Binance blocked, try Bybit
         if prices is None:
-            logger.warning("Failed to fetch real data, falling back to synthetic data")
-            prices = generate_price_data(200000)
+            logger.warning("Binance access failed, trying Bybit...")
+            prices = fetch_bybit_data(symbol, interval="60", days=days)
+        
+        # If both fail, use realistic synthetic
+        if prices is None:
+            logger.warning("API access restricted, using realistic synthetic data")
+            logger.info("💡 Tip: Use VPN to access Binance from restricted regions")
+            prices = generate_realistic_price_data(200000, trend=0.00001)
+        else:
+            # Pad with synthetic if fetched data is too small
+            if len(prices) < 10000:
+                logger.warning(f"Limited data fetched ({len(prices)} candles), padding with synthetic...")
+                additional = generate_realistic_price_data(200000 - len(prices))
+                prices = np.concatenate([prices, additional])
     else:
         logger.info("Generating synthetic price data...")
-        prices = generate_price_data(200000)
+        prices = generate_realistic_price_data(200000)
     
     logger.info(f"✅ Using {len(prices):,} price points for training")
     
