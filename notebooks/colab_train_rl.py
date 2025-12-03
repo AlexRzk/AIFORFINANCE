@@ -26,6 +26,8 @@ def install_packages():
         "pandas",
         "gymnasium",
         "tensorboard",
+        "ccxt",
+        "yfinance",  # Yahoo Finance - works everywhere, no geo-restrictions!
     ]
     for pkg in packages:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
@@ -540,7 +542,7 @@ def fetch_binance_data(
     interval: str = "1h",
     days: int = 365,
 ) -> Optional[np.ndarray]:
-    """Fetch real price data from Binance.
+    """Fetch real price data from Binance.US (works in US regions like Colab).
     
     Args:
         symbol: Trading pair (e.g., BTCUSDT, ETHUSDT)
@@ -556,50 +558,109 @@ def fetch_binance_data(
         logger.warning("ccxt not installed - install with: pip install ccxt")
         return None
     
-    try:
-        exchange = ccxt.binance({'enableRateLimit': True})
-        logger.info(f"Fetching {days} days of {symbol} data from Binance...")
-        
-        # Convert interval to milliseconds
-        interval_ms = {
-            '1m': 60000, '5m': 300000, '15m': 900000, '1h': 3600000,
-            '4h': 14400000, '1d': 86400000
-        }.get(interval, 3600000)
-        
-        all_ohlcv = []
-        end_time = int(time.time() * 1000)
-        start_time = end_time - (days * 24 * 3600 * 1000)
-        
-        current_time = start_time
-        batch_count = 0
-        while current_time < end_time:
-            try:
-                ohlcv = exchange.fetch_ohlcv(symbol, interval, current_time, limit=1000)
-                if not ohlcv:
-                    break
-                all_ohlcv.extend(ohlcv)
-                current_time = ohlcv[-1][0] + interval_ms
-                batch_count += 1
-                
-                if batch_count % 10 == 0:
-                    logger.info(f"  Fetched {len(all_ohlcv):,} candles...")
+    # Try Binance.US first (for US-based servers like Colab)
+    exchanges_to_try = [
+        ('binanceus', ccxt.binanceus({'enableRateLimit': True})),
+        ('binance', ccxt.binance({'enableRateLimit': True})),
+    ]
+    
+    # Convert interval to milliseconds
+    interval_ms = {
+        '1m': 60000, '5m': 300000, '15m': 900000, '1h': 3600000,
+        '4h': 14400000, '1d': 86400000
+    }.get(interval, 3600000)
+    
+    for exchange_name, exchange in exchanges_to_try:
+        try:
+            logger.info(f"Trying {exchange_name} for {symbol}...")
+            
+            all_ohlcv = []
+            end_time = int(time.time() * 1000)
+            start_time = end_time - (days * 24 * 3600 * 1000)
+            
+            current_time = start_time
+            batch_count = 0
+            while current_time < end_time:
+                try:
+                    ohlcv = exchange.fetch_ohlcv(symbol, interval, current_time, limit=1000)
+                    if not ohlcv:
+                        break
+                    all_ohlcv.extend(ohlcv)
+                    current_time = ohlcv[-1][0] + interval_ms
+                    batch_count += 1
                     
-            except Exception as e:
-                logger.warning(f"Error fetching batch: {e}")
-                break
+                    if batch_count % 10 == 0:
+                        logger.info(f"  Fetched {len(all_ohlcv):,} candles from {exchange_name}...")
+                        
+                except Exception as e:
+                    if "451" in str(e) or "restricted" in str(e).lower():
+                        logger.warning(f"{exchange_name} geo-restricted, trying next...")
+                        break
+                    logger.warning(f"Error fetching batch: {e}")
+                    break
+            
+            if all_ohlcv and len(all_ohlcv) > 100:
+                prices = np.array([candle[4] for candle in sorted(all_ohlcv, key=lambda x: x[0])], dtype=np.float32)
+                logger.info(f"✅ Fetched {len(prices):,} candles for {symbol} from {exchange_name}")
+                return prices
+                
+        except Exception as e:
+            logger.warning(f"{exchange_name} failed: {e}")
+            continue
+    
+    logger.warning("All Binance sources failed")
+    return None
+
+
+def fetch_yahoo_data(
+    symbol: str = "BTC-USD",
+    days: int = 365,
+) -> Optional[np.ndarray]:
+    """Fetch price data from Yahoo Finance (works everywhere, no restrictions).
+    
+    Args:
+        symbol: Yahoo Finance symbol (BTC-USD, ETH-USD, etc.)
+        days: Number of days of historical data
         
-        if not all_ohlcv:
-            logger.warning("No data fetched")
-            return None
+    Returns:
+        Array of close prices or None if fetch fails
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.warning("yfinance not installed - install with: pip install yfinance")
+        return None
+    
+    try:
+        # Map common crypto symbols to Yahoo format
+        yahoo_symbols = {
+            'BTCUSDT': 'BTC-USD', 'BTCUSD': 'BTC-USD', 'BTC': 'BTC-USD',
+            'ETHUSDT': 'ETH-USD', 'ETHUSD': 'ETH-USD', 'ETH': 'ETH-USD',
+            'BNBUSDT': 'BNB-USD', 'BNBUSD': 'BNB-USD', 'BNB': 'BNB-USD',
+            'ADAUSDT': 'ADA-USD', 'XRPUSDT': 'XRP-USD', 'DOGEUSDT': 'DOGE-USD',
+            'SOLUSDT': 'SOL-USD', 'MATICUSDT': 'MATIC-USD',
+        }
         
-        # Extract close prices and sort by timestamp
-        prices = np.array([candle[4] for candle in sorted(all_ohlcv, key=lambda x: x[0])], dtype=np.float32)
-        logger.info(f"✅ Fetched {len(prices):,} candles for {symbol}")
+        yahoo_symbol = yahoo_symbols.get(symbol.upper(), symbol)
+        logger.info(f"Fetching {days} days of {yahoo_symbol} from Yahoo Finance...")
+        
+        ticker = yf.Ticker(yahoo_symbol)
+        df = ticker.history(period=f"{days}d", interval="1h")
+        
+        if df.empty:
+            # Try daily data if hourly not available
+            df = ticker.history(period=f"{days}d", interval="1d")
+            if df.empty:
+                logger.warning(f"No data found for {yahoo_symbol}")
+                return None
+        
+        prices = df['Close'].values.astype(np.float32)
+        logger.info(f"✅ Fetched {len(prices):,} candles for {yahoo_symbol} from Yahoo Finance")
         
         return prices
         
     except Exception as e:
-        logger.error(f"Error fetching Binance data: {e}")
+        logger.error(f"Error fetching Yahoo Finance data: {e}")
         return None
 
 
@@ -720,20 +781,24 @@ def train_rl_agent(total_timesteps: int = 100000, eval_freq: int = 5000, use_rea
     
     # Generate or fetch data
     if use_real_data:
-        logger.info("Attempting to fetch real data...")
+        logger.info("Attempting to fetch real market data...")
         
-        # Try Binance first
+        # Try Binance.US first (works on Colab in US)
         prices = fetch_binance_data(symbol, interval="1h", days=days)
         
-        # If Binance blocked, try Bybit
+        # If Binance fails, try Yahoo Finance (works everywhere, no geo-restrictions!)
         if prices is None:
-            logger.warning("Binance access failed, trying Bybit...")
+            logger.info("Binance failed, trying Yahoo Finance (no restrictions)...")
+            prices = fetch_yahoo_data(symbol, days=days)
+        
+        # If Yahoo fails, try Bybit
+        if prices is None:
+            logger.info("Trying Bybit...")
             prices = fetch_bybit_data(symbol, interval="60", days=days)
         
-        # If both fail, use realistic synthetic
+        # If all fail, use realistic synthetic
         if prices is None:
-            logger.warning("API access restricted, using realistic synthetic data")
-            logger.info("💡 Tip: Use VPN to access Binance from restricted regions")
+            logger.warning("All data sources failed, using realistic synthetic data")
             prices = generate_realistic_price_data(200000, trend=0.00001)
         else:
             # Pad with synthetic if fetched data is too small
